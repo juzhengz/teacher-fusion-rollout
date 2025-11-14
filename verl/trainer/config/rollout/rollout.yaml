@@ -77,6 +77,27 @@ enable_prefix_caching: True
 # safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
 load_format: dummy
 
+# Teacher logits fusion config. Allows mixing student logits with a frozen teacher during rollout.
+teacher_fusion:
+
+  # Whether to enable teacher/student logits fusion.
+  enable: False
+
+  # Path or HF name of the teacher model used for logits fusion.
+  teacher_model_path: null
+
+  # Whether to trust remote code when loading the teacher model.
+  trust_remote_code: False
+
+  # Torch dtype for teacher model weights.
+  torch_dtype: bfloat16
+
+  # Weight for teacher logits in the mixture (alpha * teacher + (1-alpha) * student).
+  alpha: 0.5
+
+  # Temperature applied to fused logits before sampling.
+  temperature: 1.0
+
 # [Will be deprecated, use log_prob_micro_batch_size_per_gpu] The batch size for one forward pass in the computation of log_prob. Global batch size.
 log_prob_micro_batch_size: null
 

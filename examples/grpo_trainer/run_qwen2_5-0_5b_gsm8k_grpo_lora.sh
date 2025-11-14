@@ -3,7 +3,7 @@ set -x
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
-EXP_NAME=qwen2.5_3b_grpo_lora_baseline
+EXP_NAME=qwen2.5_0.5b_grpo_lora_baseline
 CKPTS_DIR=/cmlscratch/juzheng/verl_grpo/checkpoints/$EXP_NAME
 DATASET_DIR=/cmlscratch/juzheng/cache/datasets
 
@@ -18,7 +18,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=False \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-3B-Instruct \
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
     actor_rollout_ref.model.lora_rank=64 \
     actor_rollout_ref.model.lora_alpha=32 \
     actor_rollout_ref.actor.optim.lr=3e-6 \
@@ -47,11 +47,19 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name='verl_grpo' \
     trainer.experiment_name=$EXP_NAME \
     trainer.default_local_dir=$CKPTS_DIR \
+    trainer.resume_mode=disable \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \
-    trainer.total_epochs=1 $@
+    trainer.total_epochs=5 \
+    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.teacher_fusion.enable=True \
+    actor_rollout_ref.rollout.teacher_fusion.teacher_model_path=Qwen/Qwen2.5-3B-Instruct \
+    actor_rollout_ref.rollout.teacher_fusion.alpha=0.7 \
+    actor_rollout_ref.rollout.teacher_fusion.temperature=1.0 \
+    actor_rollout_ref.rollout.teacher_fusion.torch_dtype=bfloat16 \
+    $@
 
     # actor_rollout_ref.actor.ppo_mini_batch_size=256 \
     # data.train_batch_size=1024 \

@@ -27,6 +27,7 @@ When working with Megatron:
 """
 
 import asyncio
+from collections.abc import Mapping
 import getpass
 import inspect
 import logging
@@ -52,6 +53,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
 from vllm.lora.request import LoRARequest
+from transformers import AutoModelForCausalLM
 
 try:
     from vllm.worker.worker_base import WorkerWrapperBase
@@ -67,6 +69,7 @@ from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.ray_utils import ray_noset_visible_devices
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
+from verl.utils.fs import copy_to_local
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 
@@ -93,6 +96,123 @@ if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
 
 
+def _resolve_dtype(dtype_name: str) -> torch.dtype:
+    if hasattr(torch, dtype_name):
+        attr = getattr(torch, dtype_name)
+        if isinstance(attr, torch.dtype):
+            return attr
+    raise ValueError(f"Unsupported dtype '{dtype_name}' for teacher fusion")
+
+
+class TeacherFusionLogitsProcessor:
+    """Custom logits processor that mixes student logits with a frozen teacher."""
+
+    def __init__(
+        self,
+        model_path: str,
+        alpha: float,
+        temperature: float,
+        torch_dtype: str = "bfloat16",
+        trust_remote_code: bool = False,
+    ):
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+        self.model_path = model_path
+        self.alpha = alpha
+        self.temperature = temperature
+        self.torch_dtype = torch_dtype
+        self.trust_remote_code = trust_remote_code
+        self._model = None
+        self._device = None
+        self._vocab_size = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_model"] = None
+        state["_device"] = None
+        return state
+
+    def __call__(self, *args):
+        if len(args) == 2:
+            past_tokens, logits = args
+            merged_tokens = list(past_tokens)
+        elif len(args) == 3:
+            prompt_tokens, past_tokens, logits = args
+            merged_tokens = list(prompt_tokens) + list(past_tokens)
+        else:
+            raise ValueError("Unexpected logits processor signature")
+
+        if logits is None:
+            return logits
+
+        if not merged_tokens:
+            return logits
+
+        teacher_logits = self._compute_teacher_logits(
+            token_ids=merged_tokens,
+            target_dim=logits.shape[-1],
+            target_device=logits.device,
+            target_dtype=logits.dtype,
+        )
+
+        mixed = self.alpha * teacher_logits + (1 - self.alpha) * logits
+        if self.temperature not in (None, 1.0):
+            mixed = mixed / self.temperature
+        return mixed
+
+    def _compute_teacher_logits(
+        self,
+        token_ids: list[int],
+        target_dim: int,
+        target_device: torch.device,
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        model = self._ensure_model()
+        device = self._device or target_device
+        input_ids = torch.tensor(token_ids, dtype=torch.long, device=device).unsqueeze(0)
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids)
+            teacher_logits = outputs.logits[:, -1, :]
+
+        if teacher_logits.shape[-1] != target_dim:
+            raise ValueError(
+                f"Teacher vocab size {teacher_logits.shape[-1]} "
+                f"does not match student vocab size {target_dim}"
+            )
+
+        return teacher_logits.to(device=target_device, dtype=target_dtype)
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return self._model
+
+        dtype = _resolve_dtype(self.torch_dtype)
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            torch_dtype=dtype,
+            trust_remote_code=self.trust_remote_code,
+        )
+        self._model.to(device)
+        self._model.eval()
+        self._device = device
+        return self._model
+
+
+def _get_cfg_value(cfg, key, default=None):
+    """Best-effort helper to read either dataclass or mapping configs."""
+    if cfg is None:
+        return default
+    if hasattr(cfg, key):
+        return getattr(cfg, key)
+    if isinstance(cfg, Mapping):
+        return cfg.get(key, default)
+    try:
+        return cfg[key]
+    except (TypeError, KeyError):
+        return default
+
+
 class vLLMRollout(BaseRollout):
     def __init__(
         self,
@@ -116,6 +236,23 @@ class vLLMRollout(BaseRollout):
             if model_config.lora_rank > 0
             else {}
         )
+        self.teacher_fusion_processor = None
+        teacher_fusion_cfg = getattr(self.config, "teacher_fusion", None)
+        teacher_fusion_enabled = _get_cfg_value(teacher_fusion_cfg, "enable", False)
+        if teacher_fusion_enabled:
+            if self.config.enable_chunked_prefill:
+                raise ValueError("Teacher logits fusion is not compatible with chunked prefill; set enable_chunked_prefill=False.")
+            teacher_model_path = _get_cfg_value(teacher_fusion_cfg, "teacher_model_path")
+            if not teacher_model_path:
+                raise ValueError("teacher_model_path must be provided when enabling teacher fusion.")
+            local_teacher_path = copy_to_local(teacher_model_path, use_shm=model_config.use_shm)
+            self.teacher_fusion_processor = TeacherFusionLogitsProcessor(
+                model_path=local_teacher_path,
+                alpha=_get_cfg_value(teacher_fusion_cfg, "alpha", 0.5),
+                temperature=_get_cfg_value(teacher_fusion_cfg, "temperature", 1.0),
+                torch_dtype=_get_cfg_value(teacher_fusion_cfg, "torch_dtype", "bfloat16"),
+                trust_remote_code=_get_cfg_value(teacher_fusion_cfg, "trust_remote_code", False),
+            )
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), (
@@ -340,7 +477,16 @@ class vLLMRollout(BaseRollout):
                 ] * batch_size
 
         # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
+        sampling_kwargs = kwargs.copy()
+        if self.teacher_fusion_processor is not None:
+            existing_processors = sampling_kwargs.get("logits_processors")
+            if existing_processors is None:
+                sampling_kwargs["logits_processors"] = [self.teacher_fusion_processor]
+            else:
+                sampling_kwargs["logits_processors"] = list(existing_processors) + [self.teacher_fusion_processor]
+            sampling_kwargs.setdefault("temperature", 1.0)
+
+        with self.update_sampling_params(**sampling_kwargs):
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,

@@ -28,6 +28,7 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "RolloutConfig",
+    "TeacherLogitsFusionConfig",
 ]
 
 
@@ -178,6 +179,8 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
+    teacher_fusion: "TeacherLogitsFusionConfig" = field(default_factory=lambda: TeacherLogitsFusionConfig())
+
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:
@@ -190,3 +193,13 @@ class RolloutConfig(BaseConfig):
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
+
+
+@dataclass
+class TeacherLogitsFusionConfig(BaseConfig):
+    enable: bool = False
+    teacher_model_path: Optional[str] = None
+    trust_remote_code: bool = False
+    torch_dtype: str = "bfloat16"
+    alpha: float = 0.5
+    temperature: float = 1.0

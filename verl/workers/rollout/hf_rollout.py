@@ -25,7 +25,8 @@ import torch.distributed
 from tensordict import TensorDict
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from transformers import GenerationConfig
+from transformers import AutoModelForCausalLM, GenerationConfig
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 
 from verl import DataProto
 from verl.utils.device import get_device_name, get_torch_device
@@ -36,11 +37,85 @@ from .base import BaseRollout
 __all__ = ["HFRollout"]
 
 
+def _resolve_dtype(dtype_name: str) -> torch.dtype:
+    if hasattr(torch, dtype_name):
+        attr = getattr(torch, dtype_name)
+        if isinstance(attr, torch.dtype):
+            return attr
+    raise ValueError(f"Unsupported dtype '{dtype_name}' for teacher fusion")
+
+
+class HFTeacherFusionLogitsProcessor(LogitsProcessor):
+    """HF logits processor that mixes student logits with a frozen teacher."""
+
+    def __init__(
+        self,
+        model_path: str,
+        alpha: float,
+        temperature: float,
+        torch_dtype: str = "bfloat16",
+        trust_remote_code: bool = False,
+    ) -> None:
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+        self.alpha = alpha
+        self.temperature = temperature
+        self.device = get_torch_device()
+        dtype = _resolve_dtype(torch_dtype)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        ).to(self.device)
+        self.model.eval()
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if scores is None:
+            return scores
+
+        teacher_logits = self._compute_teacher_logits(input_ids, target_dim=scores.size(-1))
+        teacher_logits = teacher_logits.to(device=scores.device, dtype=scores.dtype)
+
+        mixed = self.alpha * teacher_logits + (1 - self.alpha) * scores
+        if self.temperature not in (None, 1.0):
+            mixed = mixed / self.temperature
+        return mixed
+
+    @torch.no_grad()
+    def _compute_teacher_logits(self, input_ids: torch.LongTensor, target_dim: int) -> torch.Tensor:
+        outputs = self.model(input_ids=input_ids.to(self.device))
+        teacher_logits = outputs.logits[:, -1, :]
+        if teacher_logits.size(-1) != target_dim:
+            raise ValueError(
+                "Teacher vocab size does not match student vocab size: "
+                f"teacher={teacher_logits.size(-1)}, student={target_dim}"
+            )
+        return teacher_logits
+
+
 class HFRollout(BaseRollout):
     def __init__(self, module: nn.Module, config):
         super().__init__()
         self.config = config
         self.module = module
+        self.teacher_fusion_processor = self._maybe_build_teacher_fusion_processor()
+
+    def _maybe_build_teacher_fusion_processor(self):
+        teacher_cfg = getattr(self.config, "teacher_fusion", None)
+        if teacher_cfg is None or not getattr(teacher_cfg, "enable", False):
+            return None
+
+        teacher_model_path = getattr(teacher_cfg, "teacher_model_path", None)
+        if not teacher_model_path:
+            raise ValueError("teacher_model_path must be provided when enabling teacher fusion.")
+
+        return HFTeacherFusionLogitsProcessor(
+            model_path=teacher_model_path,
+            alpha=getattr(teacher_cfg, "alpha", 0.5),
+            temperature=getattr(teacher_cfg, "temperature", 1.0),
+            torch_dtype=getattr(teacher_cfg, "torch_dtype", "bfloat16"),
+            trust_remote_code=getattr(teacher_cfg, "trust_remote_code", False),
+        )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
@@ -92,6 +167,9 @@ class HFRollout(BaseRollout):
 
         # make config according to generate mode
         generation_config = GenerationConfig(**kwargs)
+        logits_processor = None
+        if self.teacher_fusion_processor is not None:
+            logits_processor = LogitsProcessorList([self.teacher_fusion_processor])
 
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         prompt_length = idx.size(1)
@@ -118,6 +196,7 @@ class HFRollout(BaseRollout):
                 eos_token_id=eos_token_id,
                 pad_token_id=pad_token_id,
                 generation_config=generation_config,
+                logits_processor=logits_processor,
                 output_scores=False,  # this is potentially very large
                 return_dict_in_generate=True,
                 use_cache=True,
