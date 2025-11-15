@@ -2,6 +2,7 @@
 set -x
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
+export VLLM_USE_V1=0
 
 EXP_NAME=qwen2.5_0.5b_grpo_lora_baseline
 CKPTS_DIR=/cmlscratch/juzheng/verl_grpo/checkpoints/$EXP_NAME

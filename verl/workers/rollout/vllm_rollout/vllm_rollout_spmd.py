@@ -27,6 +27,7 @@ When working with Megatron:
 """
 
 import asyncio
+from collections import Counter
 from collections.abc import Mapping
 import getpass
 import inspect
@@ -36,7 +37,7 @@ import pickle
 import socket
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from types import MethodType
 from typing import Any, Generator
 
@@ -104,6 +105,12 @@ def _resolve_dtype(dtype_name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype '{dtype_name}' for teacher fusion")
 
 
+@dataclass
+class _TeacherCacheEntry:
+    past_key_values: Any
+    logits: torch.Tensor
+
+
 class TeacherFusionLogitsProcessor:
     """Custom logits processor that mixes student logits with a frozen teacher."""
 
@@ -125,11 +132,15 @@ class TeacherFusionLogitsProcessor:
         self._model = None
         self._device = None
         self._vocab_size = None
+        self._state_cache: dict[tuple[int, ...], _TeacherCacheEntry] = {}
+        self._sequence_counts: Counter[tuple[int, ...]] = Counter()
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_model"] = None
         state["_device"] = None
+        state["_state_cache"] = {}
+        state["_sequence_counts"] = Counter()
         return state
 
     def __call__(self, *args):
@@ -160,6 +171,11 @@ class TeacherFusionLogitsProcessor:
             mixed = mixed / self.temperature
         return mixed
 
+    def reset_cache(self):
+        """Drop cached KV states so future batches don't reuse stale tensors."""
+        self._state_cache.clear()
+        self._sequence_counts.clear()
+
     def _compute_teacher_logits(
         self,
         token_ids: list[int],
@@ -167,20 +183,64 @@ class TeacherFusionLogitsProcessor:
         target_device: torch.device,
         target_dtype: torch.dtype,
     ) -> torch.Tensor:
-        model = self._ensure_model()
-        device = self._device or target_device
-        input_ids = torch.tensor(token_ids, dtype=torch.long, device=device).unsqueeze(0)
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids)
-            teacher_logits = outputs.logits[:, -1, :]
+        token_tuple = tuple(token_ids)
+        cache_entry = self._state_cache.get(token_tuple)
+        if cache_entry is None:
+            teacher_logits, past_key_values = self._forward_teacher(token_tuple)
+            cache_entry = _TeacherCacheEntry(past_key_values=past_key_values, logits=teacher_logits)
+            self._state_cache[token_tuple] = cache_entry
 
-        if teacher_logits.shape[-1] != target_dim:
+        self._increment_sequence_count(token_tuple)
+        prefix_key = token_tuple[:-1] if len(token_tuple) > 0 else None
+        if prefix_key:
+            self._decrement_sequence_count(prefix_key)
+
+        if cache_entry.logits.shape[-1] != target_dim:
             raise ValueError(
-                f"Teacher vocab size {teacher_logits.shape[-1]} "
+                f"Teacher vocab size {cache_entry.logits.shape[-1]} "
                 f"does not match student vocab size {target_dim}"
             )
 
-        return teacher_logits.to(device=target_device, dtype=target_dtype)
+        return cache_entry.logits.to(device=target_device, dtype=target_dtype)
+
+    def _forward_teacher(self, token_tuple: tuple[int, ...]) -> tuple[torch.Tensor, Any]:
+        if not token_tuple:
+            raise ValueError("TeacherFusionLogitsProcessor received empty token sequence.")
+
+        model = self._ensure_model()
+        if self._device is not None:
+            device = self._device
+        else:
+            device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+
+        prefix_key = token_tuple[:-1]
+        cache_entry = self._state_cache.get(prefix_key) if prefix_key else None
+        if cache_entry is not None:
+            input_ids = torch.tensor([[token_tuple[-1]]], dtype=torch.long, device=device)
+            outputs = model(
+                input_ids=input_ids,
+                past_key_values=cache_entry.past_key_values,
+                use_cache=True,
+            )
+        else:
+            input_ids = torch.tensor(token_tuple, dtype=torch.long, device=device).unsqueeze(0)
+            outputs = model(input_ids=input_ids, use_cache=True)
+
+        teacher_logits = outputs.logits[:, -1, :]
+        return teacher_logits, outputs.past_key_values
+
+    def _increment_sequence_count(self, key: tuple[int, ...]):
+        self._sequence_counts[key] += 1
+
+    def _decrement_sequence_count(self, key: tuple[int, ...]):
+        count = self._sequence_counts.get(key)
+        if count is None:
+            return
+        if count <= 1:
+            self._sequence_counts.pop(key, None)
+            self._state_cache.pop(key, None)
+        else:
+            self._sequence_counts[key] = count - 1
 
     def _ensure_model(self):
         if self._model is not None:
@@ -487,12 +547,16 @@ class vLLMRollout(BaseRollout):
             sampling_kwargs.setdefault("temperature", 1.0)
 
         with self.update_sampling_params(**sampling_kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
+            try:
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    lora_request=lora_requests,
+                    use_tqdm=False,
+                )
+            finally:
+                if self.teacher_fusion_processor is not None:
+                    self.teacher_fusion_processor.reset_cache()
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
